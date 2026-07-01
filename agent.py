@@ -1,5 +1,5 @@
 # agent.py
-# Vulnerability Finder Agent — Final version (Day 5)
+# Vulnerability Finder Agent — with Human in the Loop
 # Usage: python agent.py --target <github_url_or_local_path> [--output ./reports]
 
 import os
@@ -7,6 +7,8 @@ import shutil
 import argparse
 from typing import TypedDict, Optional
 from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.types import interrupt, Command
 from tools import fetch_github_repo, read_local_directory, run_bandit, run_pip_audit
 from enricher import enrich_with_cve, generate_report_with_llm, convert_to_html, save_report
 
@@ -23,6 +25,7 @@ class VulnScanState(TypedDict):
     dep_findings: Optional[list]
     scan_error: Optional[str]
     cve_data: Optional[list]
+    human_approved: Optional[bool]
     final_report: Optional[str]
 
 
@@ -44,7 +47,7 @@ def github_fetcher_node(state: VulnScanState) -> dict:
     if result["error"]:
         _status("github_fetcher", f"✗ {result['error']}", error=True)
         return {"repo_path": None, "fetch_error": result["error"]}
-    _status("github_fetcher", f"✓ Cloned successfully")
+    _status("github_fetcher", "✓ Cloned successfully")
     return {"repo_path": result["path"], "fetch_error": None}
 
 
@@ -94,23 +97,73 @@ def cve_enricher_node(state: VulnScanState) -> dict:
     return {"cve_data": enriched}
 
 
+def human_review_node(state: VulnScanState) -> dict:
+    """
+    Pauses the graph, shows findings summary, waits for user approval.
+    Uses interrupt() — LangGraph pauses here and resumes when Command is sent.
+    """
+    code_findings = state.get("code_findings", [])
+    dep_findings = state.get("dep_findings", [])
+    cve_data = state.get("cve_data", [])
+
+    severity_counts = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
+    for f in code_findings:
+        sev = f.get("severity", "LOW").upper()
+        if sev in severity_counts:
+            severity_counts[sev] += 1
+
+    critical_deps = [d for d in cve_data if d.get("severity") in ("CRITICAL", "HIGH")]
+
+    print()
+    print("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print("    FINDINGS SUMMARY")
+    print("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print(f"    Code issues total   : {len(code_findings)}")
+    print(f"      High              : {severity_counts['HIGH']}")
+    print(f"      Medium            : {severity_counts['MEDIUM']}")
+    print(f"      Low               : {severity_counts['LOW']}")
+    print(f"    Dep vulnerabilities : {len(dep_findings)}")
+    if cve_data:
+        print(f"      Critical/High     : {len(critical_deps)}")
+    print("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print()
+
+    # Pause graph here — value returned to the caller as interrupt signal
+    user_input = interrupt({
+        "question": "Proceed with report generation?",
+        "findings_count": len(code_findings),
+        "dep_count": len(dep_findings),
+    })
+
+    approved = str(user_input).strip().lower() in ("yes", "y")
+    if approved:
+        _status("human_review", "✓ Approved — generating report")
+    else:
+        _status("human_review", "✗ Rejected — skipping report")
+
+    return {"human_approved": approved}
+
+
 def report_generator_node(state: VulnScanState) -> dict:
+    if not state.get("human_approved"):
+        _status("report_generator", "Skipped — not approved")
+        return {"final_report": None}
+
     groq_key = os.environ.get("GROQ_API_KEY")
     if not groq_key:
-        _status("report_generator", "✗ GROQ_API_KEY not set in environment", error=True)
+        _status("report_generator", "✗ GROQ_API_KEY not set", error=True)
         return {"final_report": None}
 
     _status("report_generator", "Generating report with Groq LLM...")
 
     code_findings = state.get("code_findings", [])
-    enriched_deps = state.get("cve_data", [])
     dep_findings = state.get("dep_findings", [])
+    enriched_deps = state.get("cve_data", [])
     target = state.get("target", "unknown")
     output_dir = state.get("output_dir", "./reports")
 
-    # Handle edge case: no findings at all
     if not code_findings and not dep_findings:
-        markdown_report = f"# Security Report\n\n**Target:** {target}\n\n## Summary\n\nNo issues were identified. The codebase appears clean based on bandit static analysis and pip-audit dependency checks."
+        markdown_report = f"# Security Report\n\n**Target:** {target}\n\n## Summary\n\nNo issues identified."
     else:
         try:
             markdown_report = generate_report_with_llm(
@@ -122,13 +175,12 @@ def report_generator_node(state: VulnScanState) -> dict:
             )
         except Exception as e:
             _status("report_generator", f"✗ LLM error: {e}", error=True)
-            markdown_report = f"# Security Report\n\n**Target:** {target}\n\n## Error\n\nLLM report generation failed: {e}\n\n## Raw Findings\n\n{len(code_findings)} code issues, {len(dep_findings)} dependency vulnerabilities found."
+            markdown_report = f"# Security Report\n\n**Target:** {target}\n\n## Error\n\nLLM failed: {e}"
 
     html = convert_to_html(markdown_report, target)
     filepath = save_report(html, output_dir)
     _status("report_generator", f"✓ Report saved → {filepath}")
 
-    # Clean up temp clone
     repo_path = state.get("repo_path", "")
     if repo_path and "vuln_scan_" in repo_path:
         shutil.rmtree(repo_path, ignore_errors=True)
@@ -140,7 +192,6 @@ def report_generator_node(state: VulnScanState) -> dict:
 # ── 3. HELPERS ────────────────────────────────────────────────────────────────
 
 def _status(node: str, message: str, error: bool = False):
-    """Print a one-line status update per node."""
     prefix = "✗" if error else "›"
     print(f"  {prefix} [{node}] {message}")
 
@@ -153,7 +204,7 @@ def route_to_fetcher(state: VulnScanState) -> str:
 
 # ── 5. BUILD GRAPH ────────────────────────────────────────────────────────────
 
-def build_graph():
+def build_graph(checkpointer):
     builder = StateGraph(VulnScanState)
 
     builder.add_node("router", router_node)
@@ -162,6 +213,7 @@ def build_graph():
     builder.add_node("code_scanner", code_scanner_node)
     builder.add_node("dep_scanner", dep_scanner_node)
     builder.add_node("cve_enricher", cve_enricher_node)
+    builder.add_node("human_review", human_review_node)
     builder.add_node("report_generator", report_generator_node)
 
     builder.add_edge(START, "router")
@@ -174,40 +226,32 @@ def build_graph():
     builder.add_edge("local_reader", "code_scanner")
     builder.add_edge("code_scanner", "dep_scanner")
     builder.add_edge("dep_scanner", "cve_enricher")
-    builder.add_edge("cve_enricher", "report_generator")
+    builder.add_edge("cve_enricher", "human_review")
+    builder.add_edge("human_review", "report_generator")
     builder.add_edge("report_generator", END)
 
-    return builder.compile()
+    return builder.compile(checkpointer=checkpointer)
 
 
-# ── 6. CLI ────────────────────────────────────────────────────────────────────
+# ── 6. CLI + RUN ──────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Vulnerability Finder Agent — scans Python repos for security issues",
+        description="Vulnerability Finder Agent",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   python agent.py --target https://github.com/fportantier/vulpy
-  python agent.py --target ./my-project
-  python agent.py --target https://github.com/org/repo --output ./reports
+  python agent.py --target ./my-project --output ./reports
         """
     )
-    parser.add_argument(
-        "--target", required=True,
-        help="GitHub URL or local path to scan"
-    )
-    parser.add_argument(
-        "--output", default="./reports",
-        help="Directory to save the HTML report (default: ./reports)"
-    )
+    parser.add_argument("--target", required=True, help="GitHub URL or local path to scan")
+    parser.add_argument("--output", default="./reports", help="Directory to save HTML report")
     args = parser.parse_args()
 
-    # Validate GROQ_API_KEY early
     if not os.environ.get("GROQ_API_KEY"):
-        print("\n✗ Error: GROQ_API_KEY environment variable is not set.")
-        print("  Set it with: $env:GROQ_API_KEY=\"your-key-here\"  (PowerShell)")
-        print("  Get a free key at: https://console.groq.com/keys\n")
+        print("\n✗ Error: GROQ_API_KEY not set.")
+        print("  Set it with: $env:GROQ_API_KEY=\"your-key-here\"  (PowerShell)\n")
         return
 
     print()
@@ -218,26 +262,43 @@ Examples:
     print(f"  Output : {args.output}")
     print()
 
-    graph = build_graph()
+    with SqliteSaver.from_conn_string(":memory:") as checkpointer:
+        graph = build_graph(checkpointer)
+        config = {"configurable": {"thread_id": "scan-1"}}
 
-    result = graph.invoke({
-        "target": args.target,
-        "output_dir": args.output,
-        "input_type": None,
-        "repo_path": None,
-        "fetch_error": None,
-        "code_findings": None,
-        "dep_findings": None,
-        "scan_error": None,
-        "cve_data": None,
-        "final_report": None,
-    })
+        initial_state = {
+            "target": args.target,
+            "output_dir": args.output,
+            "input_type": None,
+            "repo_path": None,
+            "fetch_error": None,
+            "code_findings": None,
+            "dep_findings": None,
+            "scan_error": None,
+            "cve_data": None,
+            "human_approved": None,
+            "final_report": None,
+        }
 
-    if result.get("final_report"):
-        print(f"\n  ✓ Scan complete!")
-        print(f"  ✓ Open your report: {result['final_report']}\n")
-    else:
-        print("\n  ✗ Scan failed — check errors above\n")
+        # First invoke — runs until interrupt() in human_review_node
+        for event in graph.stream(initial_state, config=config, stream_mode="updates"):
+            # Check if we hit an interrupt
+            if "__interrupt__" in event:
+                user_input = input("  Proceed with report generation? (yes/no): ").strip()
+                print()
+                # Resume graph with user's answer via Command
+                result = graph.invoke(
+                    Command(resume=user_input),
+                    config=config
+                )
+                if result.get("final_report"):
+                    print(f"\n  ✓ Scan complete!")
+                    print(f"  ✓ Open your report: {result['final_report']}\n")
+                else:
+                    print("\n  ✗ Scan cancelled\n")
+                return
+
+        print("\n  ✗ Scan failed — no interrupt received\n")
 
 
 if __name__ == "__main__":
