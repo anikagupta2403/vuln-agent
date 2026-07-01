@@ -1,5 +1,5 @@
 # agent.py
-# Vulnerability Finder Agent — with Human in the Loop
+# Vulnerability Finder Agent — with Human in the Loop + Fix Agent
 # Usage: python agent.py --target <github_url_or_local_path> [--output ./reports]
 
 import os
@@ -11,6 +11,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import interrupt, Command
 from tools import fetch_github_repo, read_local_directory, run_bandit, run_pip_audit
 from enricher import enrich_with_cve, generate_report_with_llm, convert_to_html, save_report
+from fix_agent import run_fix_agent
 
 
 # ── 1. STATE ──────────────────────────────────────────────────────────────────
@@ -26,6 +27,7 @@ class VulnScanState(TypedDict):
     scan_error: Optional[str]
     cve_data: Optional[list]
     human_approved: Optional[bool]
+    fix_results: Optional[dict]       # NEW: results from fix agent
     final_report: Optional[str]
 
 
@@ -99,8 +101,8 @@ def cve_enricher_node(state: VulnScanState) -> dict:
 
 def human_review_node(state: VulnScanState) -> dict:
     """
-    Pauses the graph, shows findings summary, waits for user approval.
-    Uses interrupt() — LangGraph pauses here and resumes when Command is sent.
+    Pauses graph, shows findings summary, asks user to approve.
+    Also asks if they want the fix agent to run.
     """
     code_findings = state.get("code_findings", [])
     dep_findings = state.get("dep_findings", [])
@@ -128,7 +130,6 @@ def human_review_node(state: VulnScanState) -> dict:
     print("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     print()
 
-    # Pause graph here — value returned to the caller as interrupt signal
     user_input = interrupt({
         "question": "Proceed with report generation?",
         "findings_count": len(code_findings),
@@ -137,11 +138,43 @@ def human_review_node(state: VulnScanState) -> dict:
 
     approved = str(user_input).strip().lower() in ("yes", "y")
     if approved:
-        _status("human_review", "✓ Approved — generating report")
+        _status("human_review", "✓ Approved — proceeding")
     else:
-        _status("human_review", "✗ Rejected — skipping report")
+        _status("human_review", "✗ Rejected — stopping")
 
     return {"human_approved": approved}
+
+
+def fix_agent_node(state: VulnScanState) -> dict:
+    """
+    Runs the fix agent on HIGH severity findings.
+    Only runs if human approved and repo is available.
+    """
+    if not state.get("human_approved"):
+        return {"fix_results": None}
+
+    repo_path = state.get("repo_path")
+    if not repo_path:
+        _status("fix_agent", "No repo path — skipping fixes", error=True)
+        return {"fix_results": None}
+
+    groq_key = os.environ.get("GROQ_API_KEY")
+    if not groq_key:
+        _status("fix_agent", "✗ GROQ_API_KEY not set", error=True)
+        return {"fix_results": None}
+
+    code_findings = state.get("code_findings", [])
+    high_count = sum(1 for f in code_findings if f.get("severity", "").upper() == "HIGH")
+
+    if high_count == 0:
+        _status("fix_agent", "No HIGH severity issues to fix — skipping")
+        return {"fix_results": {"summary": "No HIGH severity issues to fix", "total_fixed": 0}}
+
+    _status("fix_agent", f"Attempting to fix {high_count} HIGH severity issues...")
+    results = run_fix_agent(code_findings, repo_path, groq_key)
+    _status("fix_agent", f"✓ {results['summary']}")
+
+    return {"fix_results": results}
 
 
 def report_generator_node(state: VulnScanState) -> dict:
@@ -159,6 +192,7 @@ def report_generator_node(state: VulnScanState) -> dict:
     code_findings = state.get("code_findings", [])
     dep_findings = state.get("dep_findings", [])
     enriched_deps = state.get("cve_data", [])
+    fix_results = state.get("fix_results")
     target = state.get("target", "unknown")
     output_dir = state.get("output_dir", "./reports")
 
@@ -177,10 +211,23 @@ def report_generator_node(state: VulnScanState) -> dict:
             _status("report_generator", f"✗ LLM error: {e}", error=True)
             markdown_report = f"# Security Report\n\n**Target:** {target}\n\n## Error\n\nLLM failed: {e}"
 
+    # Append fix summary to report if fixes were applied
+    if fix_results and fix_results.get("total_fixed", 0) > 0:
+        fixes = fix_results.get("fixes_applied", [])
+        fixed_list = [f for f in fixes if f["status"] == "fixed"]
+        fix_section = "\n\n## Automated Fixes Applied\n\n"
+        fix_section += f"The fix agent automatically patched **{len(fixed_list)}** HIGH severity issues:\n\n"
+        for f in fixed_list:
+            from pathlib import Path
+            fix_section += f"- `{Path(f['file']).name}` line {f['line']} — {f['test_id']}: {f['issue'][:80]}\n"
+        fix_section += "\n> These fixes have been applied to the local repository copy.\n"
+        markdown_report += fix_section
+
     html = convert_to_html(markdown_report, target)
     filepath = save_report(html, output_dir)
     _status("report_generator", f"✓ Report saved → {filepath}")
 
+    # Clean up temp clone
     repo_path = state.get("repo_path", "")
     if repo_path and "vuln_scan_" in repo_path:
         shutil.rmtree(repo_path, ignore_errors=True)
@@ -214,6 +261,7 @@ def build_graph(checkpointer):
     builder.add_node("dep_scanner", dep_scanner_node)
     builder.add_node("cve_enricher", cve_enricher_node)
     builder.add_node("human_review", human_review_node)
+    builder.add_node("fix_agent", fix_agent_node)
     builder.add_node("report_generator", report_generator_node)
 
     builder.add_edge(START, "router")
@@ -227,7 +275,8 @@ def build_graph(checkpointer):
     builder.add_edge("code_scanner", "dep_scanner")
     builder.add_edge("dep_scanner", "cve_enricher")
     builder.add_edge("cve_enricher", "human_review")
-    builder.add_edge("human_review", "report_generator")
+    builder.add_edge("human_review", "fix_agent")       # fix agent runs after approval
+    builder.add_edge("fix_agent", "report_generator")
     builder.add_edge("report_generator", END)
 
     return builder.compile(checkpointer=checkpointer)
@@ -277,20 +326,25 @@ Examples:
             "scan_error": None,
             "cve_data": None,
             "human_approved": None,
+            "fix_results": None,
             "final_report": None,
         }
 
-        # First invoke — runs until interrupt() in human_review_node
+        # Stream until interrupt
         for event in graph.stream(initial_state, config=config, stream_mode="updates"):
-            # Check if we hit an interrupt
             if "__interrupt__" in event:
                 user_input = input("  Proceed with report generation? (yes/no): ").strip()
                 print()
-                # Resume graph with user's answer via Command
                 result = graph.invoke(
                     Command(resume=user_input),
                     config=config
                 )
+
+                # Print fix summary if available
+                fix_results = result.get("fix_results")
+                if fix_results and fix_results.get("total_fixed", 0) > 0:
+                    print(f"\n  ✓ Auto-fixed {fix_results['total_fixed']} HIGH severity issues")
+
                 if result.get("final_report"):
                     print(f"\n  ✓ Scan complete!")
                     print(f"  ✓ Open your report: {result['final_report']}\n")
@@ -298,7 +352,7 @@ Examples:
                     print("\n  ✗ Scan cancelled\n")
                 return
 
-        print("\n  ✗ Scan failed — no interrupt received\n")
+        print("\n  ✗ Scan failed\n")
 
 
 if __name__ == "__main__":
