@@ -1,5 +1,5 @@
 # agent.py
-# Vulnerability Finder Agent — Human approves each fix individually
+# Vulnerability Finder Agent — Full pipeline with PR opener
 # Usage: python agent.py --target <github_url_or_local_path> [--output ./reports]
 
 import os
@@ -13,9 +13,8 @@ from tools import fetch_github_repo, read_local_directory, run_bandit, run_pip_a
 from enricher import enrich_with_cve, generate_report_with_llm, convert_to_html, save_report
 from fix_agent import prepare_fixes, apply_approved_fix, show_diff
 from critic_agent import run_critic, regenerate_with_feedback, format_critic_section
+from pr_opener import open_pr_with_fixes
 
-
-# ── 1. STATE ──────────────────────────────────────────────────────────────────
 
 class VulnScanState(TypedDict):
     target: str
@@ -28,15 +27,19 @@ class VulnScanState(TypedDict):
     scan_error: Optional[str]
     cve_data: Optional[list]
     human_approved: Optional[bool]
-    fix_proposals: Optional[list]        # proposed fixes waiting for approval
-    fix_results: Optional[list]          # applied/skipped fixes
+    fix_proposals: Optional[list]
+    fix_results: Optional[list]
     markdown_report: Optional[str]
     critic_feedback: Optional[dict]
     critic_iteration: Optional[int]
     final_report: Optional[str]
+    pr_url: Optional[str]
 
 
-# ── 2. NODES ──────────────────────────────────────────────────────────────────
+def _status(node: str, message: str, error: bool = False):
+    prefix = "✗" if error else "›"
+    print(f"  {prefix} [{node}] {message}")
+
 
 def router_node(state: VulnScanState) -> dict:
     target = state["target"].strip()
@@ -105,11 +108,8 @@ def cve_enricher_node(state: VulnScanState) -> dict:
 
 
 def human_review_node(state: VulnScanState) -> dict:
-    """Initial pause — show findings summary, ask if user wants to proceed."""
     code_findings = state.get("code_findings", [])
     dep_findings = state.get("dep_findings", [])
-    cve_data = state.get("cve_data", [])
-
     severity_counts = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
     for f in code_findings:
         sev = f.get("severity", "LOW").upper()
@@ -130,56 +130,38 @@ def human_review_node(state: VulnScanState) -> dict:
 
     user_input = interrupt("Proceed with fix proposals and report generation?")
     approved = str(user_input).strip().lower() in ("yes", "y")
-
     if approved:
         _status("human_review", "✓ Approved — preparing fixes")
     else:
         _status("human_review", "✗ Rejected — stopping")
-
     return {"human_approved": approved}
 
 
 def fix_proposal_node(state: VulnScanState) -> dict:
-    """
-    Generates fix proposals for all HIGH severity findings.
-    Does NOT apply them yet — just prepares the proposals.
-    """
     if not state.get("human_approved"):
         return {"fix_proposals": [], "fix_results": []}
-
     repo_path = state.get("repo_path")
     if not repo_path:
         _status("fix_proposal", "No repo path — skipping fixes")
         return {"fix_proposals": [], "fix_results": []}
-
     groq_key = os.environ.get("GROQ_API_KEY")
     code_findings = state.get("code_findings", [])
     high_count = sum(1 for f in code_findings if f.get("severity", "").upper() == "HIGH")
-
     if high_count == 0:
         _status("fix_proposal", "No HIGH severity issues to fix")
         return {"fix_proposals": [], "fix_results": []}
-
     _status("fix_proposal", f"Generating fix proposals for {high_count} HIGH severity issues...")
     proposals = prepare_fixes(code_findings, repo_path, groq_key)
     _status("fix_proposal", f"✓ {len(proposals)} fix proposals ready for review")
-
     return {"fix_proposals": proposals, "fix_results": []}
 
 
 def human_fix_review_node(state: VulnScanState) -> dict:
-    """
-    Pauses for EACH proposed fix individually.
-    User can approve (yes), skip (no), or skip all remaining (skip).
-    """
     proposals = state.get("fix_proposals", [])
     fix_results = state.get("fix_results", []) or []
-
-    # Find first pending proposal
     pending = [p for p in proposals if p.get("status") == "pending"]
 
     if not pending:
-        # All proposals reviewed — done
         total_fixed = sum(1 for r in fix_results if r.get("status") == "fixed")
         _status("human_fix_review", f"✓ All fixes reviewed — {total_fixed} applied")
         return {"fix_proposals": proposals, "fix_results": fix_results}
@@ -200,13 +182,11 @@ def human_fix_review_node(state: VulnScanState) -> dict:
     response = str(user_input).strip().lower()
 
     if response in ("skip all", "skip"):
-        # Mark all remaining pending as skipped
         for p in proposals:
             if p.get("status") == "pending":
                 p["status"] = "skipped"
         _status("human_fix_review", "Skipping all remaining fixes")
         return {"fix_proposals": proposals, "fix_results": fix_results}
-
     elif response in ("yes", "y"):
         result = apply_approved_fix(proposal)
         proposal["status"] = result["status"]
@@ -224,12 +204,7 @@ def report_generator_node(state: VulnScanState) -> dict:
     if not state.get("human_approved"):
         _status("report_generator", "Skipped — not approved")
         return {"markdown_report": None}
-
     groq_key = os.environ.get("GROQ_API_KEY")
-    if not groq_key:
-        _status("report_generator", "✗ GROQ_API_KEY not set", error=True)
-        return {"markdown_report": None}
-
     code_findings = state.get("code_findings", [])
     dep_findings = state.get("dep_findings", [])
     enriched_deps = state.get("cve_data", [])
@@ -259,7 +234,6 @@ def report_generator_node(state: VulnScanState) -> dict:
                 _status("report_generator", f"✗ LLM error: {e}", error=True)
                 markdown_report = f"# Security Report\n\n**Target:** {target}\n\n## Error\n\nLLM failed: {e}"
 
-    # Append fix summary
     if fix_results:
         fixed = [f for f in fix_results if f.get("status") == "fixed"]
         skipped = [f for f in fix_results if f.get("status") == "skipped"]
@@ -282,7 +256,6 @@ def report_generator_node(state: VulnScanState) -> dict:
 def critic_agent_node(state: VulnScanState) -> dict:
     if not state.get("human_approved") or not state.get("markdown_report"):
         return {"final_report": None}
-
     groq_key = os.environ.get("GROQ_API_KEY")
     markdown_report = state["markdown_report"]
     target = state.get("target", "unknown")
@@ -304,15 +277,9 @@ def critic_agent_node(state: VulnScanState) -> dict:
 
     critic_section = format_critic_section(feedback, iteration + 1)
     final_markdown = markdown_report + critic_section
-
     html = convert_to_html(final_markdown, target)
     filepath = save_report(html, output_dir)
     _status("critic_agent", f"✓ Final report saved → {filepath}")
-
-    repo_path = state.get("repo_path", "")
-    if repo_path and "vuln_scan_" in repo_path:
-        shutil.rmtree(repo_path, ignore_errors=True)
-        _status("critic_agent", "Cleaned up temp clone")
 
     return {
         "critic_feedback": feedback,
@@ -321,21 +288,51 @@ def critic_agent_node(state: VulnScanState) -> dict:
     }
 
 
-# ── 3. HELPERS ────────────────────────────────────────────────────────────────
+def pr_opener_node(state: VulnScanState) -> dict:
+    target = state.get("target", "")
+    if not target.startswith("https://github.com/"):
+        _status("pr_opener", "Skipping — target is not a GitHub URL")
+        return {"pr_url": None}
 
-def _status(node: str, message: str, error: bool = False):
-    prefix = "✗" if error else "›"
-    print(f"  {prefix} [{node}] {message}")
+    fix_results = state.get("fix_results") or []
+    fixed = [f for f in fix_results if f.get("status") == "fixed"]
+    if not fixed:
+        _status("pr_opener", "Skipping — no fixes were applied")
+        return {"pr_url": None}
 
+    github_token = os.environ.get("GITHUB_TOKEN")
+    if not github_token:
+        _status("pr_opener", "✗ GITHUB_TOKEN not set — skipping PR", error=True)
+        return {"pr_url": None}
 
-# ── 4. ROUTING ────────────────────────────────────────────────────────────────
+    repo_path = state.get("repo_path", "")
+    final_report = state.get("final_report", "")
+
+    _status("pr_opener", f"Opening PR with {len(fixed)} fix(es)...")
+    result = open_pr_with_fixes(
+        target_url=target,
+        repo_path=repo_path,
+        fix_results=fix_results,
+        report_path=final_report,
+        github_token=github_token
+    )
+
+    if repo_path and "vuln_scan_" in repo_path:
+        shutil.rmtree(repo_path, ignore_errors=True)
+        _status("pr_opener", "Cleaned up temp clone")
+
+    if result.get("success"):
+        return {"pr_url": result["url"]}
+    else:
+        _status("pr_opener", f"✗ PR failed: {result.get('error')}", error=True)
+        return {"pr_url": None}
+
 
 def route_to_fetcher(state: VulnScanState) -> str:
     return "github_fetcher" if state["input_type"] == "github" else "local_reader"
 
 
 def route_after_fix_review(state: VulnScanState) -> str:
-    """Keep looping through fix_review until no pending proposals remain."""
     proposals = state.get("fix_proposals", [])
     pending = [p for p in proposals if p.get("status") == "pending"]
     if pending:
@@ -349,10 +346,8 @@ def route_after_critic(state: VulnScanState) -> str:
     if feedback.get("verdict") == "needs_revision" and iteration == 1:
         _status("critic_agent", "→ Triggering report revision...")
         return "report_generator"
-    return END
+    return "pr_opener"
 
-
-# ── 5. BUILD GRAPH ────────────────────────────────────────────────────────────
 
 def build_graph(checkpointer):
     builder = StateGraph(VulnScanState)
@@ -368,6 +363,7 @@ def build_graph(checkpointer):
     builder.add_node("human_fix_review", human_fix_review_node)
     builder.add_node("report_generator", report_generator_node)
     builder.add_node("critic_agent", critic_agent_node)
+    builder.add_node("pr_opener", pr_opener_node)
 
     builder.add_edge(START, "router")
     builder.add_conditional_edges(
@@ -391,24 +387,15 @@ def build_graph(checkpointer):
     builder.add_conditional_edges(
         "critic_agent",
         route_after_critic,
-        {"report_generator": "report_generator", END: END}
+        {"report_generator": "report_generator", "pr_opener": "pr_opener"}
     )
+    builder.add_edge("pr_opener", END)
 
     return builder.compile(checkpointer=checkpointer)
 
 
-# ── 6. CLI + RUN ──────────────────────────────────────────────────────────────
-
 def main():
-    parser = argparse.ArgumentParser(
-        description="Vulnerability Finder Agent",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python agent.py --target https://github.com/fportantier/vulpy
-  python agent.py --target ./my-project --output ./reports
-        """
-    )
+    parser = argparse.ArgumentParser(description="Vulnerability Finder Agent")
     parser.add_argument("--target", required=True, help="GitHub URL or local path to scan")
     parser.add_argument("--output", default="./reports", help="Directory to save HTML report")
     args = parser.parse_args()
@@ -447,34 +434,27 @@ Examples:
             "critic_feedback": None,
             "critic_iteration": 0,
             "final_report": None,
+            "pr_url": None,
         }
 
-        config_run = config.copy()
-
-        # Stream and handle ALL interrupts in a loop
-        result = None
         current_input = initial_state
 
         while True:
             interrupted = False
-            for event in graph.stream(current_input, config=config_run, stream_mode="updates"):
+            for event in graph.stream(current_input, config=config, stream_mode="updates"):
                 if "__interrupt__" in event:
                     interrupted = True
                     interrupt_val = event["__interrupt__"][0].value
-
-                    # Determine prompt based on interrupt type
-                    if "fix" in str(interrupt_val).lower() or "apply" in str(interrupt_val).lower():
-                        user_input = input(f"  {interrupt_val} ").strip()
+                    if "apply" in str(interrupt_val).lower():
+                        user_input = input(f"  Apply this fix? (yes / no / skip all): ").strip()
                     else:
                         user_input = input("  Proceed with fix proposals and report generation? (yes/no): ").strip()
-
                     print()
                     current_input = Command(resume=user_input)
                     break
 
             if not interrupted:
-                # Graph completed — get final state
-                final_state = graph.get_state(config_run)
+                final_state = graph.get_state(config)
                 result = final_state.values
                 break
 
@@ -483,12 +463,14 @@ Examples:
 
         if fixed_count > 0:
             print(f"\n  ✓ Auto-fixed {fixed_count} HIGH severity issues")
-
         if result.get("final_report"):
-            print(f"\n  ✓ Scan complete!")
-            print(f"  ✓ Open your report: {result['final_report']}\n")
+            print(f"\n  ✓ Report: {result['final_report']}")
+        if result.get("pr_url"):
+            print(f"\n  ✓ Pull Request opened → {result['pr_url']}\n")
+        elif fixed_count > 0:
+            print(f"\n  ℹ Set GITHUB_TOKEN to auto-open a PR with these fixes\n")
         else:
-            print("\n  ✗ Scan cancelled\n")
+            print()
 
 
 if __name__ == "__main__":
