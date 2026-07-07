@@ -1,5 +1,5 @@
 # agent.py
-# Vulnerability Finder Agent — Full pipeline with PR opener
+# Vulnerability Finder Agent — Full pipeline with Langfuse observability
 # Usage: python agent.py --target <github_url_or_local_path> [--output ./reports]
 
 import os
@@ -9,12 +9,15 @@ from typing import TypedDict, Optional
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import interrupt, Command
+from langfuse.langchain import CallbackHandler
 from tools import fetch_github_repo, read_local_directory, run_bandit, run_pip_audit
 from enricher import enrich_with_cve, generate_report_with_llm, convert_to_html, save_report
 from fix_agent import prepare_fixes, apply_approved_fix, show_diff
 from critic_agent import run_critic, regenerate_with_feedback, format_critic_section
 from pr_opener import open_pr_with_fixes
 
+
+# ── 1. STATE ──────────────────────────────────────────────────────────────────
 
 class VulnScanState(TypedDict):
     target: str
@@ -36,10 +39,7 @@ class VulnScanState(TypedDict):
     pr_url: Optional[str]
 
 
-def _status(node: str, message: str, error: bool = False):
-    prefix = "✗" if error else "›"
-    print(f"  {prefix} [{node}] {message}")
-
+# ── 2. NODES ──────────────────────────────────────────────────────────────────
 
 def router_node(state: VulnScanState) -> dict:
     target = state["target"].strip()
@@ -328,6 +328,15 @@ def pr_opener_node(state: VulnScanState) -> dict:
         return {"pr_url": None}
 
 
+# ── 3. HELPERS ────────────────────────────────────────────────────────────────
+
+def _status(node: str, message: str, error: bool = False):
+    prefix = "✗" if error else "›"
+    print(f"  {prefix} [{node}] {message}")
+
+
+# ── 4. ROUTING ────────────────────────────────────────────────────────────────
+
 def route_to_fetcher(state: VulnScanState) -> str:
     return "github_fetcher" if state["input_type"] == "github" else "local_reader"
 
@@ -348,6 +357,8 @@ def route_after_critic(state: VulnScanState) -> str:
         return "report_generator"
     return "pr_opener"
 
+
+# ── 5. BUILD GRAPH ────────────────────────────────────────────────────────────
 
 def build_graph(checkpointer):
     builder = StateGraph(VulnScanState)
@@ -394,6 +405,8 @@ def build_graph(checkpointer):
     return builder.compile(checkpointer=checkpointer)
 
 
+# ── 6. CLI + RUN ──────────────────────────────────────────────────────────────
+
 def main():
     parser = argparse.ArgumentParser(description="Vulnerability Finder Agent")
     parser.add_argument("--target", required=True, help="GitHub URL or local path to scan")
@@ -405,6 +418,17 @@ def main():
         print("  Set it with: $env:GROQ_API_KEY=\"your-key-here\"  (PowerShell)\n")
         return
 
+    # ── Langfuse setup ────────────────────────────────────────────────────────
+    langfuse_handler = None
+    if os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY"):
+        try:
+            langfuse_handler = CallbackHandler()
+            print("  › [langfuse] ✓ Tracing enabled")
+        except Exception as e:
+            print(f"  › [langfuse] ✗ Could not initialize: {e}")
+    else:
+        print("  › [langfuse] Tracing disabled — set LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY to enable")
+
     print()
     print("╔══════════════════════════════════════════╗")
     print("║      Vulnerability Finder Agent          ║")
@@ -415,7 +439,11 @@ def main():
 
     with SqliteSaver.from_conn_string(":memory:") as checkpointer:
         graph = build_graph(checkpointer)
+
+        # Add Langfuse callback to config if available
         config = {"configurable": {"thread_id": "scan-1"}}
+        if langfuse_handler:
+            config["callbacks"] = [langfuse_handler]
 
         initial_state = {
             "target": args.target,
@@ -457,6 +485,14 @@ def main():
                 final_state = graph.get_state(config)
                 result = final_state.values
                 break
+
+        # Flush Langfuse traces before exit
+        if langfuse_handler:
+            try:
+                langfuse_handler.langfuse.flush()
+                print("\n  › [langfuse] ✓ Traces flushed — view at cloud.langfuse.com")
+            except Exception:
+                pass
 
         fix_results = result.get("fix_results") or []
         fixed_count = sum(1 for f in fix_results if f.get("status") == "fixed")
